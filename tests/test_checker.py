@@ -11,6 +11,10 @@ from ai_code_checker.reviewer import SYSTEM_PROMPT, build_prompts
 from ai_code_checker.static_checks import run_static_checks
 
 
+# Assembled at runtime so this repository itself never contains a key-shaped string.
+FAKE_KEY = "sk-" + "live_" + "abcdefghijklmnopqrstuvwxyz123456"
+
+
 def git(root: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True).stdout
 
@@ -38,7 +42,7 @@ def repo(tmp_path: Path) -> Path:
         "import fastmoney\n"
         "from app import helpers\n"
         "\n"
-        "API_KEY = 'sk-live_abcdefghijklmnopqrstuvwxyz123456'\n"
+        f"API_KEY = '{FAKE_KEY}'\n"
         "\n"
         "def total(items, discount=0):\n"
         "    subtotal = sum(i['price'] for i in items)\n"
@@ -184,7 +188,7 @@ def test_no_false_positives_from_docs_strings_and_http_named_packages(tmp_path):
         "diff --git a/src/m.py b/src/m.py\n--- a/src/m.py\n+++ b/src/m.py\n@@ -0,0 +1,2 @@\n"
         "+import httpx2\n+FIXTURE = '    # ... existing code ...'\n"
         "diff --git a/tests/test_m.py b/tests/test_m.py\n--- a/tests/test_m.py\n+++ b/tests/test_m.py\n@@ -0,0 +1,1 @@\n"
-        "+KEY = 'sk-live_abcdefghijklmnopqrstuvwxyz123456'\n"
+        f"+KEY = '{FAKE_KEY}'\n"
     )
     findings = run_static_checks(parse_unified_diff(diff), tmp_path)
     assert [(f.path, f.severity, f.category) for f in findings] == [("tests/test_m.py", "low", "security")]
