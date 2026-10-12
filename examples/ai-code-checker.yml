@@ -1,0 +1,30 @@
+# Copy this file to .github/workflows/ai-code-checker.yml in the repository you want reviewed,
+# and add your Claude API key as a repository secret named ANTHROPIC_API_KEY.
+name: AI Code Checker
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# A newer push replaces a review still running for an older one, so the PR never gets two summaries.
+concurrency:
+  group: ai-code-checker-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      # Install your project's dependencies here if you want the checker to run your tests.
+      - uses: haidermoulay3mk/ai-code-checker@main
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # test-command: pytest -q

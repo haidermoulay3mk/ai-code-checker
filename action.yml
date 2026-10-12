@@ -1,0 +1,50 @@
+name: AI Code Checker
+description: Explains every pull request in plain English, flags bugs, security problems, invented code and out-of-scope changes, and suggests fixes. It never approves or merges.
+branding:
+  icon: search
+  color: purple
+
+inputs:
+  anthropic-api-key:
+    description: Claude API key. Store it as a repository secret.
+    required: false
+  github-token:
+    description: Token used to read the pull request and post comments.
+    default: ${{ github.token }}
+  test-command:
+    description: Command that runs your tests, for example "pytest -q" or "npm test". Leave empty to skip.
+    default: ""
+  fail-on:
+    description: Mark the check failed when an issue this severe or worse is found (high, medium, low, never).
+    default: high
+  model:
+    description: Claude model to use.
+    default: claude-opus-5-5
+  effort:
+    description: How hard Claude thinks (low, medium, high, xhigh, max).
+    default: high
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - shell: bash
+      run: pip install --quiet "${{ github.action_path }}"
+    - shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_TEST_COMMAND: ${{ inputs.test-command }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_EFFORT: ${{ inputs.effort }}
+      run: |
+        args=(github --fail-on "$INPUT_FAIL_ON" --model "$INPUT_MODEL" --effort "$INPUT_EFFORT")
+        if [ -n "$INPUT_TEST_COMMAND" ]; then args+=(--test-command "$INPUT_TEST_COMMAND"); fi
+        if [ -z "$ANTHROPIC_API_KEY" ]; then
+          echo "::warning::No anthropic-api-key given; running the automatic checks only."
+          args+=(--no-ai)
+        fi
+        ai-code-checker "${args[@]}"
