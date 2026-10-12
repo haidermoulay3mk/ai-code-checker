@@ -88,7 +88,7 @@ def test_static_checks_catch_invented_package_secret_and_leftovers(repo):
     by_title = {(f.category, f.line): f for f in findings}
     # fastmoney is not declared anywhere; yaml maps to PyYAML; os is stdlib; app is local.
     invented = [f for f in findings if f.category == "invented"]
-    assert [f.title for f in invented] == ["`fastmoney` is imported but not declared as a dependency"]
+    assert [f.title for f in invented] == ["`fastmoney` is imported but not in requirements or pyproject"]
     assert ("security", 7) in by_title
     assert ("leftover", 14) in by_title and by_title[("leftover", 14)].severity == "high"
     assert ("leftover", 15) in by_title and by_title[("leftover", 15)].suggestion == ""
@@ -103,6 +103,66 @@ def test_js_imports_checked_against_package_json(tmp_path):
     )
     findings = run_static_checks(parse_unified_diff(diff), tmp_path)
     assert [f.title for f in findings] == ["`super-magic-lib` is imported but not in package.json"]
+
+
+def js_diff(path: str, *lines: str) -> str:
+    return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n" + "".join(
+        f"+{line}\n" for line in lines
+    )
+
+
+def test_runtime_modules_and_console_log_are_not_flagged(tmp_path):
+    # Found running the checker over a Bun + TypeScript app: these were all false alarms.
+    (tmp_path / "package.json").write_text('{"dependencies": {"react": "19"}}')
+    diff = js_diff(
+        "src/server.ts",
+        "import { test, expect } from 'bun:test'",
+        "import { serve } from 'bun'",
+        "import fs from 'node:fs/promises'",
+        "import lodash from 'npm:lodash'",
+        "console.log('listening on', port)",
+    )
+    assert run_static_checks(parse_unified_diff(diff), tmp_path) == []
+
+
+def test_packages_only_in_the_lockfile_are_undeclared_not_invented(tmp_path):
+    (tmp_path / "package.json").write_text('{"dependencies": {"kokoro-js": "1.2.1", "@remotion/studio": "4"}}')
+    (tmp_path / "bun.lock").write_text(
+        '{\n  "packages": {\n'
+        '    "@huggingface/transformers": ["@huggingface/transformers@3.8.1", "", {}, "sha512-x"],\n'
+        '    "@remotion/studio": ["@remotion/studio@4.0.532", "", { "dependencies": { "@remotion/media": "4" } }],\n'
+        '    "@remotion/media": ["@remotion/media@4.0.532", "", {}, "sha512-y"],\n'
+        '  }\n}\n'
+    )
+    diff = js_diff(
+        "src/tts.ts",
+        "const { pipeline } = await import('@huggingface/transformers')",
+        "export { Video } from '@remotion/media'",
+        "import magic from 'super-magic-lib'",
+    )
+    findings = run_static_checks(parse_unified_diff(diff), tmp_path)
+    assert [(f.line, f.severity, f.category) for f in findings] == [
+        (1, "medium", "bug"), (2, "medium", "bug"), (3, "high", "invented"),
+    ]
+    assert findings[0].title == "`@huggingface/transformers` is imported but only installed indirectly"
+    assert "bun.lock does not install it either" in findings[2].explanation
+
+
+def test_other_lockfile_formats_are_read(tmp_path):
+    (tmp_path / "package.json").write_text('{"dependencies": {}}')
+    (tmp_path / "package-lock.json").write_text('{"packages": {"node_modules/a/node_modules/deep-dep": {}}}')
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\ndependencies = ["requests"]\n')
+    (tmp_path / "uv.lock").write_text('[[package]]\nname = "urllib3"\nversion = "2.2.0"\n')
+    diff = js_diff("src/a.js", "const d = require('deep-dep')") + js_diff("app/net.py", "import urllib3", "import requests")
+    findings = run_static_checks(parse_unified_diff(diff), tmp_path)
+    assert [(f.path, f.severity) for f in findings] == [("src/a.js", "medium"), ("app/net.py", "medium")]
+    assert "uv.lock has it" in findings[1].explanation
+
+
+def test_debugger_line_with_other_code_gets_no_one_click_delete(tmp_path):
+    diff = js_diff("app/x.py", "import pdb; pdb.set_trace()", "breakpoint()")
+    findings = run_static_checks(parse_unified_diff(diff), tmp_path)
+    assert [(f.line, f.suggestion) for f in findings] == [(1, None), (2, "")]
 
 
 def test_ai_findings_with_lines_outside_the_diff_lose_their_line(repo):

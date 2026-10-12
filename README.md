@@ -17,7 +17,7 @@ Two layers run on every pull request:
 
 | Layer | What it does | Needs a Claude API key |
 |---|---|---|
-| Automatic checks | Imports not declared in `requirements.txt` / `pyproject.toml` / `package.json`, secrets, placeholders, debug leftovers | No |
+| Automatic checks | Imports not declared in `requirements.txt` / `pyproject.toml` / `package.json` (the lockfile tells an invented package from one only installed indirectly), secrets, placeholders, debug leftovers | No |
 | Claude review | Explanation, goal check, bugs, security, invented APIs, fixes, suggested tests (model `claude-opus-5-5`) | Yes |
 
 If the Claude review cannot run (no key, API down), the automatic checks still post their results.
