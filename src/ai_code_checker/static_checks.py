@@ -26,12 +26,22 @@ NODE_BUILTINS = {
     "os", "path", "perf_hooks", "process", "punycode", "querystring", "readline", "repl", "stream",
     "string_decoder", "sys", "timers", "tls", "trace_events", "tty", "url", "util", "v8", "vm",
     "wasi", "worker_threads", "zlib", "test",
+    "bun",  # Bun's own runtime module
 }
+NODE_LOCKFILES = ("bun.lock", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml")
+PY_LOCKFILES = ("uv.lock", "poetry.lock", "pdm.lock")
 
 PY_IMPORT_RE = re.compile(r"^\s*(?:from\s+([\w\.]+)\s+import|import\s+([\w\.]+(?:\s*,\s*[\w\.]+)*))")
 JS_IMPORT_RE = re.compile(
-    r"""(?:import\s[^'"]*?from\s*|import\s*\(\s*|require\s*\(\s*|^\s*import\s+)['"]([^'"]+)['"]"""
+    r"""(?:(?:import|export)\s[^'"]*?from\s*|import\s*\(\s*|require\s*\(\s*|^\s*import\s+)['"]([^'"]+)['"]"""
 )
+# `bun:test`, `node:fs`, `npm:x`, `jsr:@std/x`, `virtual:`, URLs: provided by the runtime or bundler, not package.json.
+JS_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]*:")
+# Package names as lockfiles spell them: `"name@1.2.3"`, `name@^1:`, `/name@1.2.3:`, `"node_modules/name"`.
+NODE_LOCK_NAME_RE = re.compile(
+    r"""(?:^|[\s"'])/?((?:@[\w.-]+/)?[\w.-]+)@|node_modules/((?:@[\w.-]+/)?[\w.-]+)""", re.M
+)
+PY_LOCK_NAME_RE = re.compile(r'^name\s*=\s*"([^"]+)"', re.M)
 
 SECRET_PATTERNS = [
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS access key"),
@@ -58,7 +68,6 @@ CODE_FILE_RE = re.compile(
 DEBUG_PATTERNS = [
     (re.compile(r"^\s*debugger;?\s*$"), "debugger statement"),
     (re.compile(r"\b(?:breakpoint\(\)|pdb\.set_trace\(\)|ipdb\.set_trace\(\))"), "debugger breakpoint"),
-    (re.compile(r"^\s*console\.log\("), "console.log left in"),
 ]
 
 TEST_PATH_RE = re.compile(r"(?:^|/)(?:tests?|__tests__|spec)/|(?:_test|\.test|\.spec|test_)[^/]*$")
@@ -141,6 +150,61 @@ def declared_node_deps(root: Path) -> set[str] | None:
     return names
 
 
+def locked_python_packages(root: Path) -> set[str]:
+    """Every package a Python lockfile installs, including ones pulled in by other packages."""
+    names: set[str] = set()
+    for lock in PY_LOCKFILES:
+        if (root / lock).exists():
+            names |= {_norm(n) for n in PY_LOCK_NAME_RE.findall((root / lock).read_text(errors="ignore"))}
+    pipfile_lock = root / "Pipfile.lock"
+    if pipfile_lock.exists():
+        try:
+            data = json.loads(pipfile_lock.read_text())
+        except json.JSONDecodeError:
+            data = {}
+        for section in ("default", "develop"):
+            names |= {_norm(n) for n in (data.get(section) or {})}
+    return names
+
+
+def locked_node_packages(root: Path) -> tuple[set[str], str | None]:
+    """Every package a Node lockfile installs, and that lockfile's name (None if there is none)."""
+    names: set[str] = set()
+    found = None
+    for lock in NODE_LOCKFILES:
+        if (root / lock).exists():
+            found = found or lock
+            for a, b in NODE_LOCK_NAME_RE.findall((root / lock).read_text(errors="ignore")):
+                names.add(a or b)
+    return names, found
+
+
+def _undeclared(path: str, line: int, name: str, manifest: str, locked: bool, lockfile: str | None) -> Finding:
+    if locked:
+        return Finding(
+            path=path, line=line, severity="medium", category="bug",
+            title=f"`{name}` is imported but only installed indirectly",
+            explanation=(
+                f"`{name}` is installed today only because another package depends on it ({lockfile} has it). "
+                "If that package drops it or changes its version, this import breaks. "
+                f"Add `{name}` to {manifest} so the project depends on it on purpose."
+            ),
+            source="static",
+        )
+    return Finding(
+        path=path, line=line, severity="high", category="invented",
+        title=f"`{name}` is imported but not in {manifest}",
+        explanation=(
+            f"`{name}` is not built in, not part of this repo, and not declared in {manifest}. "
+            + (f"{lockfile} does not install it either, so the package was most likely invented, or it was never "
+               "added: " if lockfile else "Either the package was invented, or it was never added to the "
+               "dependencies: ")
+            + "a fresh install or CI build will fail on this import."
+        ),
+        source="static",
+    )
+
+
 def _python_imports(line: str) -> list[str]:
     m = PY_IMPORT_RE.match(line)
     if not m:
@@ -156,6 +220,9 @@ def check_imports(files: list[FileDiff], root: Path) -> list[Finding]:
     py_deps = declared_python_deps(root)
     py_local = local_python_modules(root)
     node_deps = declared_node_deps(root)
+    py_locked = locked_python_packages(root) if py_deps is not None else set()
+    py_lockfile = next((n for n in (*PY_LOCKFILES, "Pipfile.lock") if (root / n).exists()), None)
+    node_locked, node_lockfile = locked_node_packages(root) if node_deps is not None else (set(), None)
     stdlib = set(sys.stdlib_module_names)
 
     for f in files:
@@ -169,34 +236,18 @@ def check_imports(files: list[FileDiff], root: Path) -> list[Finding]:
                     dist = _norm(PY_IMPORT_ALIASES.get(mod, mod))
                     if dist in py_deps or _norm(mod) in py_deps:
                         continue
-                    findings.append(Finding(
-                        path=f.path, line=line_no, severity="high", category="invented",
-                        title=f"`{mod}` is imported but not declared as a dependency",
-                        explanation=(
-                            f"`{mod}` is not in the standard library, not a module in this repo, and not listed in "
-                            "requirements or pyproject. Either the package was invented, or it was never added to the "
-                            "dependencies, so a fresh install will fail with ModuleNotFoundError."
-                        ),
-                        source="static",
-                    ))
+                    locked = dist in py_locked or _norm(mod) in py_locked
+                    findings.append(_undeclared(f.path, line_no, mod, "requirements or pyproject", locked, py_lockfile))
         if re.search(r"\.(?:[cm]?[jt]sx?)$", f.path) and node_deps is not None:
             for line_no, text in f.added_lines.items():
                 for spec in JS_IMPORT_RE.findall(text):
-                    if spec.startswith((".", "/", "~", "@/", "#")) or spec.startswith("node:"):
+                    if spec.startswith((".", "/", "~", "@/", "#")) or JS_SCHEME_RE.match(spec):
                         continue
                     parts = spec.split("/")
                     name = "/".join(parts[:2]) if spec.startswith("@") else parts[0]
                     if name in NODE_BUILTINS or name in node_deps or f"@types/{name}" in node_deps:
                         continue
-                    findings.append(Finding(
-                        path=f.path, line=line_no, severity="high", category="invented",
-                        title=f"`{name}` is imported but not in package.json",
-                        explanation=(
-                            f"`{name}` is not a Node built-in and not declared in package.json. Either the package was "
-                            "invented, or it is missing from dependencies, so installs and CI builds will fail."
-                        ),
-                        source="static",
-                    ))
+                    findings.append(_undeclared(f.path, line_no, name, "package.json", name in node_locked, node_lockfile))
     return findings
 
 
@@ -248,7 +299,8 @@ def check_leftovers(files: list[FileDiff]) -> list[Finding]:
                         path=f.path, line=line_no, severity="low", category="leftover",
                         title=f"{label[0].upper()}{label[1:]}",
                         explanation="Debug code that should not ship.",
-                        suggestion="" if label != "console.log left in" else None,
+                        # Offer one-click deletion only when the line holds nothing else.
+                        suggestion="" if pattern.fullmatch(text.strip()) else None,
                         source="static",
                     ))
                     break
